@@ -1,0 +1,18 @@
+# RTX 4080 / Ubuntu; Python 3.10; PyTorch installed from cu124 index separately.
+numpy==1.23.5
+scipy==1.10.1
+scikit-image==0.19.3
+opencv-python==4.8.1.78
+Pillow==9.5.0
+matplotlib==3.7.5
+networkx==2.8.8
+PyWavelets==1.4.1
+trimesh==3.23.5
+embreex==2.17.7.post7
+rtree==1.4.1
+pyexr==0.5.0
+PyOpenGL==3.1.9
+shapely==2.0.7
+xxhash==3.6.0
+tqdm==4.67.1
+gdown==5.2.0
