@@ -94,17 +94,15 @@ class BaseOptions():
         g_model.add_argument('--use_tanh', action='store_true',
                              help='using tanh after last conv of image_filter network')
 
-        # 针对options的第一次内容加入 开始
-
         # Triplane-PIFu related
         g_tri = parser.add_argument_group('Triplane-PIFu')
 
         # --------------------------------------------------
-        # Generator：图像特征转为三平面
+        # 生成器：根据图像特征生成三个特征平面
         # --------------------------------------------------
 
-        # 单个平面的输出通道数。
-        # Sampler 输出通道数为 3 * triplane_dim。
+        # 每个平面位置保存多少维特征。
+        # 三个平面取值后拼接，总特征维度为 3 * triplane_dim。
         g_tri.add_argument(
             '--triplane_dim',
             type=int,
@@ -112,7 +110,7 @@ class BaseOptions():
             help='Number of feature channels per plane.',
         )
 
-        # Transformer 内部特征维度。
+        # Transformer 处理每个位置时使用的特征维度。
         g_tri.add_argument(
             '--triplane_inner_dim',
             type=int,
@@ -120,7 +118,7 @@ class BaseOptions():
             help='Hidden dimension of the triplane Transformer.',
         )
 
-        # 将输入图像特征池化为 R x R，再转为图像 tokens。
+        # 先把图像特征缩小到 R x R，每个位置作为一个 token 交给 Transformer。
         g_tri.add_argument(
             '--triplane_image_token_res',
             type=int,
@@ -128,7 +126,7 @@ class BaseOptions():
             help='Spatial resolution of the image token grid.',
         )
 
-        # 每个平面初始查询网格的分辨率。
+        # 每个平面最开始使用的网格边长，例如 16 表示 16 x 16 个位置。
         g_tri.add_argument(
             '--triplane_low_res',
             type=int,
@@ -136,7 +134,7 @@ class BaseOptions():
             help='Initial query-grid resolution of each plane.',
         )
 
-        # 上采样后，每个输出平面的分辨率。
+        # 最终输出的平面边长，例如 64 表示 64 x 64 个位置。
         g_tri.add_argument(
             '--triplane_high_res',
             type=int,
@@ -166,7 +164,7 @@ class BaseOptions():
         )
 
         # --------------------------------------------------
-        # Sampler：投影深度转换为三平面采样坐标
+        # 采样器：用深度范围的中心和半宽，把投影深度换算成平面坐标
         # q_z = (projected_depth - center) / radius
         # --------------------------------------------------
 
@@ -183,8 +181,6 @@ class BaseOptions():
             default=None,
             help='Positive half-width of the projected depth range.',
         )
-
-        # 针对options的第一次内容加入 结束
 
         # for train
         parser.add_argument('--random_flip', action='store_true', help='if random flip')

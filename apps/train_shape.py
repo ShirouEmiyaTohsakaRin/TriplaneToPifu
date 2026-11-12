@@ -58,13 +58,13 @@ def train(opt):
     print('test data size: ', len(test_data_loader))
 
     # create net
-    # 创建融合模型。
+    # 创建同时使用图像特征和三平面特征的 PIFu 模型。
     netG = HybridPIFuNet(
         opt,
         projection_mode=projection_mode,
     ).to(device=cuda)
 
-    # 联合训练所有具有可学习参数的子模块。
+    # 一起训练图像编码器、三平面生成器和预测用的 MLP。
     optimizerG = torch.optim.RMSprop(
         netG.parameters(),
         lr=opt.learning_rate,

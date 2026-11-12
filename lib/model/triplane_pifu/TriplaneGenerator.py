@@ -4,16 +4,8 @@ import torch.nn as nn
 
 def make_grid_coordinates(resolution):
     """
-    构造二维规则网格坐标。
-
-    返回：
-        [resolution * resolution, 2]
-
-    每个坐标对的顺序：
-        (水平坐标, 垂直坐标)
-
-    坐标范围：
-        [-1, 1]
+    在 [-1, 1] 范围内均匀放置 resolution × resolution 个网格点。
+    返回 [resolution * resolution, 2]，每行依次是水平坐标、垂直坐标。
     """
     axis = torch.linspace(
         -1.0,
@@ -35,7 +27,8 @@ def make_grid_coordinates(resolution):
 
 class TriplaneGenerator(nn.Module):
     """
-    从 PIFu 图像特征生成视图对齐的三个特征平面。
+    根据 PIFu 图像特征，生成三个可供三维点查询的特征平面。
+    每个平面位置存放一组特征数值，不是图片的 RGB 颜色。
 
     输入：
         image_features: [B, image_feat_dim, H, W]
@@ -43,16 +36,14 @@ class TriplaneGenerator(nn.Module):
     输出：
         planes: [B, 3, triplane_dim, R, R]
 
-    平面顺序及存储方向：
-        0: xy，横轴为 x，纵轴为 y
-        1: xz，横轴为 x，纵轴为 z
-        2: yz，横轴为 y，纵轴为 z
+    B 是输入图像数；多视图时，同一物体的每张图像分别生成一组三平面。
+    R 是输出平面的边长。代码用 xy、xz、yz 表示三个平面：
+        0: xy，横轴是图像横坐标 u，纵轴是图像纵坐标 v。
+        1: xz，横轴是 u，纵轴是归一化深度。
+        2: yz，横轴是 v，纵轴是归一化深度。
 
-    查询构造：
-        坐标编码 + 平面身份编码 + 图片全局条件
-
-    注意力实现：
-        PyTorch 标准 TransformerDecoderLayer。
+    先告诉 Transformer 每个位置在哪、属于哪个平面，以及图片的整体信息；
+    再用 PyTorch 的 TransformerDecoderLayer 从图像特征中读取信息。
     """
 
     def __init__(
@@ -121,7 +112,7 @@ class TriplaneGenerator(nn.Module):
         self.triplane_high_res = triplane_high_res
         self.triplane_dim = triplane_dim
 
-        # 固定网格可以由配置重新生成，不作为学习参数保存。
+        # 网格坐标是固定的，不参与训练；加载模型时可按配置重建，无需存入权重文件。
         self.register_buffer(
             "image_coordinates",
             make_grid_coordinates(image_token_res),
@@ -135,7 +126,7 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # 1. 将 PIFu 图像特征转换成图像 tokens
+        # 1. 缩小图像特征图，并把每个网格位置的特征作为一个 token
         # --------------------------------------------------
         self.image_pool = nn.AdaptiveAvgPool2d(
             image_token_res
@@ -159,17 +150,17 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # 2. 构造三平面查询
+        # 2. 为三个平面的每个网格位置准备初始特征，交给 Transformer 查询图像
         # --------------------------------------------------
 
-        # 平面内部二维坐标的编码。
+        # 把网格坐标转换成特征，让网络知道这是平面上的哪个位置。
         self.query_position = nn.Sequential(
             nn.Linear(2, inner_dim),
             nn.GELU(),
             nn.Linear(inner_dim, inner_dim),
         )
 
-        # 三个可学习向量，分别标识 xy、xz、yz。
+        # 给 xy、xz、yz 各准备一组可学习的数值，让网络区分三个平面。
         self.plane_embedding = nn.Embedding(
             3,
             inner_dim,
@@ -180,7 +171,7 @@ class TriplaneGenerator(nn.Module):
             std=0.02,
         )
 
-        # 将当前图片的整体特征转换成查询条件。
+        # 把当前图片的整体信息加入每个平面位置的初始特征。
         self.image_condition = nn.Sequential(
             nn.Linear(inner_dim, inner_dim),
             nn.GELU(),
@@ -193,10 +184,10 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # 3. 标准 Transformer 解码层
+        # 3. 用 Transformer 让平面位置之间交换信息，并读取图像特征
         # --------------------------------------------------
 
-        # 分别创建各层，使它们独立初始化。
+        # 每层单独创建，各自初始化参数。
         self.decoder_layers = nn.ModuleList([
             nn.TransformerDecoderLayer(
                 d_model=inner_dim,
@@ -217,10 +208,10 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # 4. 平面细化与上采样
+        # 4. 放大特征平面，并用卷积调整每个位置的特征
         # --------------------------------------------------
 
-        # 三个平面使用相同的输出网络，分别进行计算。
+        # 三个平面分别处理，但共用同一套卷积参数。
         head_dim = max(
             triplane_dim,
             inner_dim // 4,
@@ -259,7 +250,7 @@ class TriplaneGenerator(nn.Module):
                 nn.GELU(),
             ])
 
-        # 输出为潜在特征，保留正负数值，不使用 Sigmoid。
+        # 这里输出的是特征，不是概率，因此保留正负值，不用 Sigmoid 压到 0～1。
         readout.append(
             nn.Conv2d(
                 head_dim,
@@ -300,7 +291,7 @@ class TriplaneGenerator(nn.Module):
         tokens_per_plane = low_res ** 2
 
         # --------------------------------------------------
-        # Step 1：图像特征适配
+        # 步骤 1：缩小图像特征图，并调整为 Transformer 使用的特征维度
         # [B, C, H, W] -> [B, D, S, S]
         # --------------------------------------------------
         projected = self.image_projection(
@@ -308,7 +299,7 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # Step 2：构造带位置编码的图像 memory
+        # 步骤 2：把图像特征排成序列，加入位置信息，供 Transformer 读取
         # [B, D, S, S] -> [B, S*S, D]
         # --------------------------------------------------
         image_tokens = projected.flatten(2).transpose(1, 2)
@@ -322,10 +313,10 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # Step 3：构造图片条件化的三平面查询
+        # 步骤 3：用网格位置、平面编号和图片整体信息，组成平面查询的初始特征
         # --------------------------------------------------
 
-        # 平面内部位置：[1, 1, L*L, D]
+        # 每个网格位置对应的特征：[1, 1, L*L, D]
         position = self.query_position(
             self.plane_coordinates.to(image_tokens)
         ).reshape(
@@ -335,7 +326,7 @@ class TriplaneGenerator(nn.Module):
             self.inner_dim,
         )
 
-        # 平面身份：[1, 3, 1, D]
+        # 区分三个平面的特征：[1, 3, 1, D]
         identity = self.plane_embedding.weight.reshape(
             1,
             3,
@@ -343,7 +334,7 @@ class TriplaneGenerator(nn.Module):
             self.inner_dim,
         )
 
-        # 图片条件：[B, 1, 1, D]
+        # 每张图片的整体特征：[B, 1, 1, D]
         condition = self.image_condition(
             projected.mean(dim=(2, 3))
         ).reshape(
@@ -353,7 +344,8 @@ class TriplaneGenerator(nn.Module):
             self.inner_dim,
         )
 
-        # 广播相加，得到 [B, 3, L*L, D]。
+        # 利用广播把三部分相加，让每张图、每个平面、每个位置都有对应特征。
+        # 结果形状：[B, 3, L*L, D]。
         queries = position + identity + condition
 
         queries = queries.reshape(
@@ -365,7 +357,7 @@ class TriplaneGenerator(nn.Module):
         queries = self.query_norm(queries)
 
         # --------------------------------------------------
-        # Step 4：自注意力、交叉注意力、前馈更新
+        # 步骤 4：平面位置之间交换信息（自注意力），再读取图像信息（交叉注意力）并更新特征
         # --------------------------------------------------
         for layer in self.decoder_layers:
             queries = layer(
@@ -376,7 +368,7 @@ class TriplaneGenerator(nn.Module):
         queries = self.output_norm(queries)
 
         # --------------------------------------------------
-        # Step 5：将序列还原为三个二维特征平面
+        # 步骤 5：把更新后的序列重新排成三个二维网格
         # --------------------------------------------------
 
         # [B, 3*L*L, D] -> [B, 3, L, L, D]
@@ -393,7 +385,7 @@ class TriplaneGenerator(nn.Module):
             0, 1, 4, 2, 3
         ).contiguous()
 
-        # 将三个平面作为独立样本送入共享输出网络。
+        # 把三个平面分别送入同一个卷积网络处理。
         # [B, 3, D, L, L] -> [B*3, D, L, L]
         planes = planes.reshape(
             batch_size * 3,
@@ -403,7 +395,7 @@ class TriplaneGenerator(nn.Module):
         )
 
         # --------------------------------------------------
-        # Step 6：空间细化、上采样和通道转换
+        # 步骤 6：放大平面，并调整到指定的输出特征维度
         # --------------------------------------------------
         planes = self.plane_readout(planes)
 

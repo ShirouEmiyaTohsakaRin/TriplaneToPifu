@@ -6,42 +6,17 @@ from ..SurfaceClassifier import SurfaceClassifier
 
 class HybridOccupancyDecoder(nn.Module):
     """
-    将像素特征、三平面特征和深度特征融合，
-    预测每个三维查询点的 Occupancy。
+    把三类特征拼在一起，预测每个点位于物体内部的概率（Occupancy）。
 
-    对应核心函数：
-        s(X | I) = f_theta(
-            F_pixel(pi(X)),
-            F_tri(X),
-            z(X)
-        )
+    B 是物体数，V 是每个物体的视图数，N 是查询点数。
+    输入特征由外部准备好，本模块只负责拼接和预测：
+        pixel_feat: [B*V, pixel_dim, N]，在点的图像投影位置取到的特征。
+        tri_feat: [B*V, 3*plane_dim, N]，从 xy、xz、yz 三个平面取到的特征。
+        depth_feat: [B*V, 1, N]，经过 PIFu DepthNormalizer 处理的深度。
+    输出 occupancy: [B, 1, N]，每个点对应一个 0 到 1 之间的预测值。
 
-    输入：
-        pixel_feat:
-            [B*V, pixel_dim, N]
-            从 PIFu 图像特征图采样得到的像素对齐特征。
-
-        tri_feat:
-            [B*V, 3 * plane_dim, N]
-            TriplaneSampler 输出的三平面特征。
-            通道顺序为 xy、xz、yz。
-
-        depth_feat:
-            [B*V, 1, N]
-            经过 PIFu DepthNormalizer 处理的深度特征。
-
-    输出：
-        occupancy:
-            [B, 1, N]
-            每个查询点位于物体内部的预测概率。
-
-    注意：
-        三个输入必须对应同一批查询点，且点的排列顺序一致。
-        V 个视图必须连续存放；view_mask 只用于视图聚合，不是第四类特征。
-
-        本模块只负责特征融合与 Occupancy 预测。
-        坐标投影、平面采样、深度归一化和空间掩码，
-        均由外部模块负责。
+    三类特征的点顺序必须一致，同一物体的 V 个视图必须连续存放。
+    view_mask 标记点在哪些视图的图像范围内，用于合并这些视图的信息。
     """
 
     def __init__(
@@ -53,20 +28,12 @@ class HybridOccupancyDecoder(nn.Module):
         num_views=1,
     ):
         """
-        参数：
-            pixel_dim:
-                像素特征的通道数。
-
-            plane_dim:
-                单个特征平面的通道数。
-                不是三个平面拼接后的总通道数。
-
-            hidden_dims:
-                点级 MLP 的隐藏层宽度。
-
-            no_residual:
-                False：使用 PIFu 原有的输入拼接跳连。
-                True：使用普通逐层 MLP。
+        pixel_dim: 每个点从图像中取到多少维特征。
+        plane_dim: 每个平面的特征维度，三个平面拼接后是它的 3 倍。
+        hidden_dims: MLP 各隐藏层的特征维度。
+        no_residual: False 时，后续层会再次拼入最初的输入特征；
+            True 时，只使用上一层的输出。
+        num_views: 每个物体输入多少个视图。
         """
         super().__init__()
 
@@ -92,10 +59,10 @@ class HybridOccupancyDecoder(nn.Module):
         self.pixel_dim = pixel_dim
         self.plane_dim = plane_dim
 
-        # Sampler 将 xy、xz、yz 三个平面的采样结果按通道拼接。
+        # 每个平面提供 plane_dim 维特征，三个拼起来就是 3 倍。
         self.tri_dim = 3 * plane_dim
 
-        # PIFu 深度特征是每个查询点一个标量。
+        # 每个查询点只需要一个深度数值。
         self.depth_dim = 1
 
         # 默认：256 + 3 * 32 + 1 = 353。
@@ -105,11 +72,9 @@ class HybridOccupancyDecoder(nn.Module):
             + self.depth_dim
         )
 
-        # 复用已有 PIFu 的点级 MLP。
-        # 修改输入维度，使其能够接收三类融合特征。
-        #
-        # 按原 PIFu 的方式在 MLP 中间聚合视图，输出物体批次 B。
-        # 最后的 Sigmoid 将输出转换为 Occupancy 概率。
+        # 沿用 PIFu 的 MLP，把输入大小调整为三类特征的总维度。
+        # 多视图时，在 MLP 中间合并同一物体各视图的信息。
+        # 最后用 Sigmoid 得到 0～1 之间的内部概率。
         self.classifier = SurfaceClassifier(
             filter_channels=[
                 self.input_dim,
@@ -127,7 +92,7 @@ class HybridOccupancyDecoder(nn.Module):
         tri_feat,
         depth_feat,
     ):
-        """检查输入类型、形状、通道数和设备。"""
+        """检查三类特征的类型和尺寸是否符合要求，以及是否在同一设备上。"""
         inputs = (
             ("pixel_feat", pixel_feat, self.pixel_dim),
             ("tri_feat", tri_feat, self.tri_dim),
@@ -194,10 +159,8 @@ class HybridOccupancyDecoder(nn.Module):
         view_mask=None,
     ):
         """
-        对同一组查询点进行特征融合和 Occupancy 预测。
-
-        返回：
-            occupancy: [B, 1, N]
+        拼接同一组点的三类特征，交给 MLP 预测。
+        返回 occupancy: [B, 1, N]，表示各点位于物体内部的概率。
         """
         self._validate_features(
             pixel_feat,
@@ -205,7 +168,7 @@ class HybridOccupancyDecoder(nn.Module):
             depth_feat,
         )
 
-        # 沿通道维拼接，查询点维度 N 保持不变。
+        # 将同一个点的三类特征拼在一起，点的数量和顺序保持不变。
         #
         # 默认：
         # [B, 256, N]
@@ -222,7 +185,7 @@ class HybridOccupancyDecoder(nn.Module):
             dim=1,
         )
 
-        # SurfaceClassifier 内部已经包含最后的 Sigmoid。
+        # SurfaceClassifier 最后已经做了 Sigmoid，这里直接使用它输出的概率。
         occupancy = self.classifier(fused_feat, view_mask=view_mask)
 
         return occupancy

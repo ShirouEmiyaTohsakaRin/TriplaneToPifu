@@ -7,28 +7,17 @@ import torch.nn.functional as F
 
 class TriplaneSampler(nn.Module):
     """
-    从 TriplaneGenerator 输出的三个平面中采样特征。
+    按查询点的位置，从三个特征平面中取值，再拼接成一组特征。
 
-    平面顺序：
-        0: xy，横轴为 x，纵轴为 y
-        1: xz，横轴为 x，纵轴为 z
-        2: yz，横轴为 y，纵轴为 z
+    先调用 normalize_coordinates()，把投影坐标 (u, v, d) 转成
+    q = (u, v, 归一化深度)，再调用 forward(planes, q) 取特征。
+    三个平面依次为 xy、xz、yz，对应 (u, v)、(u, 深度)、(v, 深度)。
+    每对坐标的第一个值是横坐标，第二个值是纵坐标。
 
-    坐标转换：
-        normalize_coordinates(projected_xyz)
-
-        输入为 PIFu 投影后的 (u,v,d) 坐标 [B*V, 3, N]，
-        输出为三平面采样坐标 q。
-
-    特征采样：
-        forward(planes, q)
-
-        planes: [B, 3, C, H, W]
-        q:      [B, 3, N]，已经归一化
-        output: [B, 3*C, N]
-
-    三平面有效空间为 [-1, 1]^3。
-    越界点的三平面特征设为零，但不强制其 occupancy 为零。
+    planes: [B, 3, C, H, W]；q: [B, 3, N]；输出: [B, 3*C, N]。
+    这里 B 是输入视图总数，C 是每个平面的特征维度，N 是查询点数。
+    q 的任一坐标超出 [-1, 1] 时，该点的三平面特征全部设为 0。
+    越界时清零只表示这里取不到平面特征，不能据此判断该点在物体外部。
     """
 
     def __init__(self, depth_center, depth_radius):
@@ -50,8 +39,8 @@ class TriplaneSampler(nn.Module):
                 "depth_radius must be finite and positive."
             )
 
-        # 固定归一化参数，不参与梯度更新。
-        # 随模型移动设备，并保存在 state_dict 中。
+        # 深度范围在训练中保持不变，不作为模型参数学习。
+        # 把它们随模型一起放到 CPU 或 GPU，并保存到权重文件中。
         self.register_buffer(
             "depth_center",
             torch.tensor(
@@ -103,25 +92,16 @@ class TriplaneSampler(nn.Module):
 
     def normalize_coordinates(self, projected_xyz):
         """
-        将 PIFu 投影后的坐标转换为三平面采样坐标。
-        透视模式的 u/v 已经除以深度；这是视锥参数化，不是世界 XYZ。
+        保留图像位置 u、v，把深度换算成平面使用的坐标。
 
-        输入：
-            projected_xyz: [B, 3, N]
+        输入 projected_xyz: [B, 3, N]，三个通道依次是 u、v、投影深度 d。
+        d 必须是经过相机变换、但尚未经过 PIFu DepthNormalizer 的深度。
+        透视投影下，u、v 已经做过除以深度的运算。
 
-            前两个通道：
-                图像采样坐标 u、v。
-
-            第三个通道：
-                标定变换后的深度 d，
-                尚未经过 PIFu DepthNormalizer。
-
-        转换：
-            q = (u, v, (d - depth_center) / depth_radius)
-
-        不应传入：
-            1. 原始世界坐标；
-            2. 已经归一化过的 q。
+        返回 q = (u, v, (d - depth_center) / depth_radius)。
+        center 是深度范围的中心，radius 是范围宽度的一半。
+        例如 d = center 对应 0，d = center + radius 对应 1。
+        输入必须是投影后的坐标，不能传原始世界坐标或重复归一化后的 q。
         """
         self._validate_coordinates(
             projected_xyz,
@@ -137,7 +117,7 @@ class TriplaneSampler(nn.Module):
             projected_xyz[:, 2:3, :] - center
         ) / radius
 
-        # 不截断坐标，保留越界信息供 forward() 判断。
+        # 保留超出 [-1, 1] 的坐标，后面才能识别哪些点越界。
         return torch.cat(
             [uv, depth],
             dim=1,
@@ -145,19 +125,14 @@ class TriplaneSampler(nn.Module):
 
     def forward(self, planes, q, return_mask=False):
         """
-        参数：
-            planes: [B, 3, C, H, W]
-            q: [B, 3, N]
+        从三个平面分别取特征，并按 xy、xz、yz 的顺序拼接。
 
-            return_mask:
-                是否同时返回三平面有效空间掩码。
+        planes: [B, 3, C, H, W]，三个特征平面。
+        q: [B, 3, N]，由 normalize_coordinates() 得到的查询坐标。
+        返回 features: [B, 3*C, N]，每个点共得到 3*C 个特征数值。
 
-        返回：
-            features: [B, 3*C, N]
-                特征按 xy、xz、yz 顺序拼接。
-
-            valid_mask: [B, 1, N]，可选
-                True 表示查询点位于 [-1, 1]^3 内。
+        return_mask=True 时，还返回 valid_mask: [B, 1, N]。
+        True 表示该点的三个坐标都在 [-1, 1] 内，False 表示越界。
         """
         self._validate_coordinates(q, "q")
 
@@ -196,23 +171,23 @@ class TriplaneSampler(nn.Module):
         num_points = q.shape[2]
 
         # --------------------------------------------------
-        # Step 1：判断点是否处于三平面的有效三维范围内
+        # 步骤 1：检查每个点的三个坐标是否都在 [-1, 1] 内
         # [B, 1, N]
         # --------------------------------------------------
         valid_mask = (
             (q >= -1.0) & (q <= 1.0)
         ).all(dim=1, keepdim=True)
 
-        # 越界点临时使用安全坐标进行计算。
-        # 这些点的输出会在最后统一清零。
+        # 越界点先用坐标 0 代替，让后面的取值操作正常执行。
+        # 这些点取到的特征会在最后清零，不参与最终特征输出。
         safe_q = q.masked_fill(
             ~valid_mask,
             0.0,
         )
 
         # --------------------------------------------------
-        # Step 2：为三个平面分别构造二维查询坐标
-        # 每一对坐标都是“横坐标、纵坐标”
+        # 步骤 2：分别用 (u, v)、(u, 深度)、(v, 深度) 到三个平面上找位置
+        # 每一对坐标依次是横坐标、纵坐标。
         # [B, 3, 2, N]
         # --------------------------------------------------
         grids = torch.stack(
@@ -225,7 +200,7 @@ class TriplaneSampler(nn.Module):
         )
 
         # --------------------------------------------------
-        # Step 3：按照相同顺序合并批次和平面维度
+        # 步骤 3：把三个平面当作独立样本，连同查询坐标一起排好，方便一次取值
         # --------------------------------------------------
 
         # [B, 3, 2, N] -> [B, 3, N, 2]
@@ -250,7 +225,7 @@ class TriplaneSampler(nn.Module):
         )
 
         # --------------------------------------------------
-        # Step 4：双线性插值
+        # 步骤 4：按位置对周围四个网格点加权，得到该位置的特征（双线性插值）
         # 输出：[B*3, C, N, 1]
         # --------------------------------------------------
         sampled = F.grid_sample(
@@ -262,7 +237,7 @@ class TriplaneSampler(nn.Module):
         )
 
         # --------------------------------------------------
-        # Step 5：恢复平面维度，再拼接三个平面的通道
+        # 步骤 5：把结果按样本分组，再把三个平面的特征拼在一起
         # --------------------------------------------------
 
         # [B*3, C, N, 1] -> [B, 3, C, N]
@@ -280,7 +255,7 @@ class TriplaneSampler(nn.Module):
             num_points,
         )
 
-        # 三个平面共同遵守同一个三维有效范围。
+        # 只要点的任一坐标越界，就把它从三个平面取到的特征全部设为 0。
         features = features.masked_fill(
             ~valid_mask,
             0.0,

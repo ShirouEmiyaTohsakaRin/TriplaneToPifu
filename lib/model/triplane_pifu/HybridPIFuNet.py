@@ -13,23 +13,26 @@ from .HybridOccupancyDecoder import HybridOccupancyDecoder
 
 class HybridPIFuNet(BasePIFuNet):
     """
-    单/多视图 PIFu + tri-plane，支持正交与透视投影。
-    图像、标定、查询点沿视图展平为 B*V；标签和输出保留 B。
-    每个视图生成一组三平面，查询同一世界点后在 MLP 中聚合。
-    透视模式下平面参数为 (u, v, normalized depth)，即视锥参数化。
+    在 PIFu 中加入三平面特征，预测三维点位于物体内部的概率。
+    支持单张或多张图片，以及正交和透视投影。
+
+    B 是物体数，V 是每个物体的视图数，N 是查询点数。
+    图像、相机矩阵和查询点按 B*V 排列，同一物体的视图连续存放。
+    每个视图各生成一组三平面；MLP 合并各视图的信息后，输出 B 个物体的结果。
+    平面使用图像坐标 u、v 和归一化深度，不直接使用世界坐标 XYZ。
 
     s(X | I) = f_theta(F_pixel(pi(X)), F_tri(X), z(X))
 
-    filter(images): 编码图像，生成并缓存三平面。
-    query(points, calibs): 查询 Occupancy，复用 filter 的缓存。
-    forward(...): filter + query，可同时返回监督损失。
+    filter(images): 提取图像特征、生成三平面，并保存下来供查询使用。
+    query(points, calibs): 使用已保存的特征，预测指定点的内部概率（Occupancy）。
+    forward(...): 依次执行上面两步；提供真实标签时，还会计算损失。
     """
 
     def __init__(self, opt, projection_mode="orthogonal", error_term=None):
         if getattr(opt, "num_views", 1) < 1:
             raise ValueError("num_views must be positive.")
 
-        # 这两个量必须由数据的投影深度范围确定，不能随意默认。
+        # 先根据数据确定深度范围的中心和半宽，才能把点放到三平面中的正确位置。
         for name in ("triplane_depth_center", "triplane_depth_radius"):
             if getattr(opt, name, None) is None:
                 raise ValueError(f"Please configure opt.{name}.")
@@ -48,7 +51,7 @@ class HybridPIFuNet(BasePIFuNet):
         self.skip_hourglass = getattr(opt, "skip_hourglass", False)
 
         # --------------------------------------------------
-        # 1. PIFu 图像编码器和深度归一化器
+        # 1. 沿用 PIFu：提取图像特征，并换算深度值
         # --------------------------------------------------
         self.image_filter = HGFilter(opt)
         self.normalizer = DepthNormalizer(opt)
@@ -56,7 +59,7 @@ class HybridPIFuNet(BasePIFuNet):
         plane_dim = getattr(opt, "triplane_dim", 32)
 
         # --------------------------------------------------
-        # 2. 新版 Transformer 三平面生成器
+        # 2. 用 Transformer 根据图像特征生成三个特征平面
         # --------------------------------------------------
         self.triplane_generator = TriplaneGenerator(
             image_feat_dim=opt.hourglass_dim,
@@ -71,20 +74,20 @@ class HybridPIFuNet(BasePIFuNet):
         )
 
         # --------------------------------------------------
-        # 3. 三平面坐标归一化和特征采样
+        # 3. 换算查询点的坐标，并从三个平面取特征
         # --------------------------------------------------
         self.triplane_sampler = TriplaneSampler(
             depth_center=opt.triplane_depth_center,
             depth_radius=opt.triplane_depth_radius,
         )
 
-        # 可选浅层特征也属于 F_pixel，不增加第四类函数输入。
+        # 启用 skip_hourglass 时，把网络前面提取的浅层特征也拼入图像特征。
         pixel_dim = opt.hourglass_dim
         if self.skip_hourglass:
             pixel_dim += self.image_filter.conv1.out_channels
 
-        # 沿用原 PIFu 的隐藏层配置；
-        # 输入维度由 HybridOccupancyDecoder 自动计算。
+        # MLP 中间各层的大小沿用 PIFu 配置。
+        # 输入特征一共有多少维，由 HybridOccupancyDecoder 根据三类特征自动计算。
         mlp_dim = getattr(
             opt,
             "mlp_dim",
@@ -97,7 +100,7 @@ class HybridPIFuNet(BasePIFuNet):
             )
 
         # --------------------------------------------------
-        # 4. 三输入 Occupancy 解码器
+        # 4. 合并图像、三平面和深度特征，预测点位于物体内部的概率
         # --------------------------------------------------
         self.hybrid_decoder = HybridOccupancyDecoder(
             pixel_dim=pixel_dim,
@@ -107,18 +110,18 @@ class HybridPIFuNet(BasePIFuNet):
             num_views=self.num_views,
         )
 
-        # 只对 PIFu 部分使用原有初始化。
-        # 不对整个 self 调用 init_net，以保留 Transformer 自身的初始化。
+        # 图像编码器和 MLP 使用 PIFu 的参数初始化方式。
+        # 只初始化这两个模块，保留 Transformer 自己的初始参数。
         init_net(self.image_filter)
         init_net(self.hybrid_decoder)
 
-        # 图像级缓存：由 filter() 更新。
+        # 保存 filter() 算出的特征，之后查询不同的点时可以重复使用。
         self.im_feat_list = []
         self.tmpx = None
         self.normx = None
         self.triplanes = None
 
-        # 查询级缓存：由 query() 更新。
+        # 清空上一次查询的预测、标签和范围标记。
         self._clear_query_cache()
 
     def _clear_query_cache(self):
@@ -133,10 +136,10 @@ class HybridPIFuNet(BasePIFuNet):
         """
         images: [B*V, 3, H, W]
 
-        编码图像并生成三平面。
-        每批图像只需调用一次，随后可以多次 query()。
+        提取并保存图像特征和三平面。
+        同一批图像只需处理一次，之后可多次调用 query() 查询不同的点。
         """
-        # 清除上一批图像的缓存，避免误用旧查询结果。
+        # 换了一批图像，先清空之前保存的特征和预测。
         self.im_feat_list = []
         self.triplanes = None
         self.tmpx = None
@@ -153,25 +156,26 @@ class HybridPIFuNet(BasePIFuNet):
         if not features:
             raise RuntimeError("HGFilter returned no feature maps.")
 
-        # 训练：保留每一级图像特征，用于中间监督。
-        # 推理：只使用最后一级图像特征。
+        # 训练时保留每一级图像特征，各级都做预测并计算损失。
+        # 预测时只使用最后一级图像特征。
         self.im_feat_list = (
             features if self.training else [features[-1]]
         )
 
-        # 所有 Hourglass 预测分支共享这一组三平面。
-        # 这里不能 detach，否则 Generator 无法从 Occupancy 损失学习。
+        # 用最后一级图像特征生成三平面，前面各级做预测时也使用它。
+        # 生成的三平面不能调用 detach，否则生成器收不到损失传回的梯度，无法学习。
         self.triplanes = self.triplane_generator(features[-1])
 
     def _project_points(self, points, calibs, transforms=None):
         """
-        输出 [B, 3, N] = (u, v, d)。
+        用相机矩阵把三维点转换为图像位置 u、v 和深度 d。
+        输出形状为 [B*V, 3, N]，三个通道依次是 u、v、d。
 
         transforms 可为：
-            [2, 3]：整个批次共享的二维仿射变换。
-            [B, 2, 3]：每个样本独立的二维仿射变换。
+            [2, 3]：所有视图使用同一个二维变换矩阵。
+            [B*V, 2, 3]：每个视图使用自己的二维变换矩阵。
 
-        变换作用于归一化图像坐标，不改变深度。
+        这个额外变换只调整归一化后的图像位置，不改变深度。
         """
         batch_size = points.shape[0]
 
@@ -190,8 +194,8 @@ class HybridPIFuNet(BasePIFuNet):
                 "calibs and points must be on the same device."
             )
 
-        # 使用选择的投影；
-        # 二维变换在下面显式按批次处理。
+        # 按配置选择正交或透视投影，得到图像位置和深度。
+        # 额外的二维图像变换在下面单独处理。
         xyz = self.projection(
             points,
             calibs.to(dtype=points.dtype),
@@ -236,16 +240,16 @@ class HybridPIFuNet(BasePIFuNet):
     def query(self, points, calibs, transforms=None, labels=None):
         """
         points:
-            [B*V, 3, N]，同一物体的世界坐标按视图重复。
+            [B*V, 3, N]，世界坐标中的三维点；同一物体的点按视图数复制，顺序保持一致。
 
         calibs:
-            [B*V, 3, 4] 或 [B*V, 4, 4]。
+            [B*V, 3, 4] 或 [B*V, 4, 4]，每个视图对应一个相机矩阵。
 
         labels:
-            可选 [B, 1, N]，内部为 1，外部为 0。
+            可选的真实标签 [B, 1, N]，物体内部为 1，外部为 0。
 
-        返回并缓存：
-            [B, 1, N] Occupancy。
+        返回并保存：
+            [B, 1, N]，每个点位于物体内部的预测概率。
         """
         self._clear_query_cache()
 
@@ -286,11 +290,11 @@ class HybridPIFuNet(BasePIFuNet):
                     "labels and points must share a device."
                 )
 
-        # 每次查询都更新，包括 labels=None，防止沿用旧标签。
+        # 没有传入标签时也要设为 None，避免误用上一次查询的标签。
         self.labels = labels
 
         # --------------------------------------------------
-        # Step 1：统一投影，保证两个采样分支坐标对齐
+        # 步骤 1：先计算投影坐标，图像分支和三平面分支都用这份坐标
         # --------------------------------------------------
         xyz = self._project_points(
             points,
@@ -302,9 +306,9 @@ class HybridPIFuNet(BasePIFuNet):
         depth = xyz[:, 2:3, :]
 
         # --------------------------------------------------
-        # Step 2：三平面特征
+        # 步骤 2：换算深度，再从三个平面取出这个点的特征
         # --------------------------------------------------
-        # Sampler 同时检查坐标是否有限。
+        # 换算前会检查坐标，遇到 NaN 或无穷大时直接报错。
         q = self.triplane_sampler.normalize_coordinates(xyz)
 
         tri_feat, tri_valid = self.triplane_sampler(
@@ -316,10 +320,10 @@ class HybridPIFuNet(BasePIFuNet):
         self.triplane_valid_mask = tri_valid
 
         # --------------------------------------------------
-        # Step 3：图像范围掩码
+        # 步骤 3：标记点的投影是否落在图像范围内
         # --------------------------------------------------
-        # 仅判断是否位于图像方形采样范围内，
-        # 不是人体前景掩码。
+        # 这里只检查投影位置是否在图像边界内，
+        # 不判断该像素是否属于人体，也不判断是否被遮挡。
         self.in_img_mask = (
             (xy >= -1.0) & (xy <= 1.0)
         ).all(dim=1, keepdim=True)
@@ -330,15 +334,15 @@ class HybridPIFuNet(BasePIFuNet):
         ).any(dim=1)
 
         # --------------------------------------------------
-        # Step 4：PIFu 深度特征
+        # 步骤 4：按 PIFu 原来的方式换算深度，供 MLP 使用
         # --------------------------------------------------
-        # 不使用 q 的第三维代替。
+        # 这个深度值与三平面使用的深度坐标换算方式不同，不能直接用 q 的第三维替代。
         depth_feat = self.normalizer(
             depth,
             calibs=calibs,
         )
 
-        # 可选的浅层像素特征。
+        # 启用 skip_hourglass 时，也从浅层特征图取值。
         tmp_feat = None
         if self.skip_hourglass:
             tmp_feat = self.index(
@@ -347,7 +351,7 @@ class HybridPIFuNet(BasePIFuNet):
             )
 
         # --------------------------------------------------
-        # Step 5：各级图像特征分别与共享三平面特征融合
+        # 步骤 5：每一级图像特征都与同一份三平面特征、深度一起做预测
         # --------------------------------------------------
         for im_feat in self.im_feat_list:
             pixel_feat = self.index(
@@ -361,7 +365,7 @@ class HybridPIFuNet(BasePIFuNet):
                     dim=1,
                 )
 
-            # 三输入核心函数。
+            # 将三类特征交给 MLP；多视图时，它会合并图像范围内的视图信息。
             raw_pred = self.hybrid_decoder(
                 pixel_feat,
                 tri_feat,
@@ -369,10 +373,8 @@ class HybridPIFuNet(BasePIFuNet):
                 view_mask=self.in_img_mask,
             )
 
-            # 延续 PIFu：图像范围外的点输出 0。
-            #
-            # 不乘 tri_valid：
-            # 深度超出平面范围不等同于物体外部。
+            # 点在所有视图的图像范围外时，预测设为 0。
+            # 仅深度超出三平面范围时仍保留预测，不能直接认定点在物体外部。
             pred = raw_pred.masked_fill(
                 ~object_mask,
                 0.0,
@@ -386,14 +388,14 @@ class HybridPIFuNet(BasePIFuNet):
         return self.preds
 
     def get_im_feat(self):
-        """兼容 PIFu：返回最后一级图像特征。"""
+        """返回最后一级图像特征，供原有 PIFu 接口使用。"""
         if not self.im_feat_list:
             raise RuntimeError("Call filter(images) first.")
 
         return self.im_feat_list[-1]
 
     def get_error(self):
-        """各级 Hourglass 的 Occupancy 损失取平均。"""
+        """分别计算各级预测与真实标签的误差，再取平均作为训练损失。"""
         if self.labels is None:
             raise RuntimeError(
                 "Labels are required to compute the loss."
@@ -423,8 +425,8 @@ class HybridPIFuNet(BasePIFuNet):
         labels=None,
     ):
         """
-        有 labels：返回 (occupancy, loss)。
-        无 labels：返回 (occupancy, None)。
+        提取图像特征，再预测各查询点位于物体内部的概率。
+        提供真实标签 labels 时返回 (occupancy, loss)，否则返回 (occupancy, None)。
         """
         self.filter(images)
 
