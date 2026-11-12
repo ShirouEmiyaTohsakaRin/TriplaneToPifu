@@ -186,6 +186,7 @@ class HybridOccupancyDecoder(nn.Module):
         )
 
         # SurfaceClassifier 最后已经做了 Sigmoid，这里直接使用它输出的概率。
+        # 通过 MLP 和 Sigmoid 预测点位于物体内部的概率
         occupancy = self.classifier(fused_feat, view_mask=view_mask)
 
         return occupancy
