@@ -6,17 +6,18 @@ from ..SurfaceClassifier import SurfaceClassifier
 
 class HybridOccupancyDecoder(nn.Module):
     """
-    把三类特征拼在一起，预测每个点位于物体内部的概率（Occupancy）。
+    目的：把图像特征、三平面特征和深度放在一起，判断点是否在物体内部。
+    网络通过训练学习如何使用这三份依据，最后输出 0～1 之间的概率。
+    越接近 1，越倾向于判断点在内部；真实标签中，内部为 1，外部为 0。
 
-    B 是物体数，V 是每个物体的视图数，N 是查询点数。
-    输入特征由外部准备好，本模块只负责拼接和预测：
-        pixel_feat: [B*V, pixel_dim, N]，在点的图像投影位置取到的特征。
-        tri_feat: [B*V, 3*plane_dim, N]，从 xy、xz、yz 三个平面取到的特征。
-        depth_feat: [B*V, 1, N]，经过 PIFu DepthNormalizer 处理的深度。
-    输出 occupancy: [B, 1, N]，每个点对应一个 0 到 1 之间的预测值。
+    B 是物体数，V 是每个物体的图像数，N 是点数。
+    pixel_feat：[B*V, pixel_dim, N]，图像特征。
+    tri_feat：[B*V, 3*plane_dim, N]，三个平面取到的特征。
+    depth_feat：[B*V, 1, N]，按 PIFu 方式缩放的深度。
+    输出 occupancy：[B, 1, N]，每个物体的每个点只有一份预测。
 
-    三类特征的点顺序必须一致，同一物体的 V 个视图必须连续存放。
-    view_mask 标记点在哪些视图的图像范围内，用于合并这些视图的信息。
+    三份输入的点顺序必须相同，同一物体的各张图像要放在一起。
+    多视图时，按 view_mask 排除投影无效的视图，再在网络中间把其余视图的特征平均。
     """
 
     def __init__(
@@ -28,12 +29,13 @@ class HybridOccupancyDecoder(nn.Module):
         num_views=1,
     ):
         """
-        pixel_dim: 每个点从图像中取到多少维特征。
-        plane_dim: 每个平面的特征维度，三个平面拼接后是它的 3 倍。
-        hidden_dims: MLP 各隐藏层的特征维度。
-        no_residual: False 时，后续层会再次拼入最初的输入特征；
-            True 时，只使用上一层的输出。
-        num_views: 每个物体输入多少个视图。
+        目的：设置预测网络的大小，让它能接收三份输入。
+        pixel_dim 是图像特征长度，plane_dim 是一个平面的特征长度。
+        总输入长度为 pixel_dim + 3*plane_dim + 1，默认是 353。
+        hidden_dims 设置中间各层的大小，num_views 设置每个物体有几张图。
+
+        no_residual=False 时，后面的层还会再次收到原始输入，方便直接参考最初的依据。
+        True 时，后面的层只接收上一层的结果。
         """
         super().__init__()
 
@@ -59,22 +61,21 @@ class HybridOccupancyDecoder(nn.Module):
         self.pixel_dim = pixel_dim
         self.plane_dim = plane_dim
 
-        # 每个平面提供 plane_dim 维特征，三个拼起来就是 3 倍。
+        # 三个平面各提供 plane_dim 个数，合起来就是 3 倍。
         self.tri_dim = 3 * plane_dim
 
-        # 每个查询点只需要一个深度数值。
+        # 深度保留为一个额外输入，帮助网络区分同一像素前后的点。
         self.depth_dim = 1
 
-        # 默认：256 + 3 * 32 + 1 = 353。
+        # 把三份输入的长度加起来，默认是 256+96+1=353。
         self.input_dim = (
             self.pixel_dim
             + self.tri_dim
             + self.depth_dim
         )
 
-        # 沿用 PIFu 的 MLP，把输入大小调整为三类特征的总维度。
-        # 多视图时，在 MLP 中间合并同一物体各视图的信息。
-        # 最后用 Sigmoid 得到 0～1 之间的内部概率。
+        # 所有点使用同一套预测网络，各点的特征分别处理。
+        # 多张图像对应同一点时，网络中间会合并它们，最后输出一个 0～1 的概率。
         self.classifier = SurfaceClassifier(
             filter_channels=[
                 self.input_dim,
@@ -92,7 +93,10 @@ class HybridOccupancyDecoder(nn.Module):
         tri_feat,
         depth_feat,
     ):
-        """检查三类特征的类型和尺寸是否符合要求，以及是否在同一设备上。"""
+        """
+        目的：提前发现输入尺寸或设备不匹配的问题，给出更明确的报错。
+        这里只检查类型、尺寸和设备；点的顺序是否对应，仍要由调用者保证。
+        """
         inputs = (
             ("pixel_feat", pixel_feat, self.pixel_dim),
             ("tri_feat", tri_feat, self.tri_dim),
@@ -159,8 +163,10 @@ class HybridOccupancyDecoder(nn.Module):
         view_mask=None,
     ):
         """
-        拼接同一组点的三类特征，交给 MLP 预测。
-        返回 occupancy: [B, 1, N]，表示各点位于物体内部的概率。
+        目的：把同一个点的三份输入拼起来，得到它位于物体内部的概率。
+        各个点使用同一套预测网络，不把不同点的特征混在一起。
+        输入多张图像时，合并的是同一物体、同一点在各视图下的特征。
+        返回 [B, 1, N]，每个点对应一份概率。
         """
         self._validate_features(
             pixel_feat,
@@ -168,14 +174,8 @@ class HybridOccupancyDecoder(nn.Module):
             depth_feat,
         )
 
-        # 将同一个点的三类特征拼在一起，点的数量和顺序保持不变。
-        #
-        # 默认：
-        # [B, 256, N]
-        # [B,  96, N]
-        # [B,   1, N]
-        #       ↓
-        # [B, 353, N]
+        # 把同一点的三份输入接起来，让网络学习如何使用它们。
+        # dim=1 增加的是每个点的输入长度，点的顺序不变；默认 [B*V, 353, N]。
         fused_feat = torch.cat(
             [
                 pixel_feat,
@@ -185,8 +185,7 @@ class HybridOccupancyDecoder(nn.Module):
             dim=1,
         )
 
-        # SurfaceClassifier 最后已经做了 Sigmoid，这里直接使用它输出的概率。
-        # 通过 MLP 和 Sigmoid 预测点位于物体内部的概率
+        # 这个网络已经输出 0～1 的概率，直接返回，不要再做一次 Sigmoid 改变结果。
         occupancy = self.classifier(fused_feat, view_mask=view_mask)
 
         return occupancy
